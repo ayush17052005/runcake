@@ -218,14 +218,15 @@ const LoginPage = () => {
               </div>
             )}
 
-            {/* Admin Fallback - Enhanced */}
-            {process.env.NODE_ENV === 'development' && (
+            {/* Email/Password fallback — always shown so the app is usable
+                before Google OAuth is configured for this deployment. */}
+            {true && (
               <div className="mt-8">
                 <div className="border-t border-gray-200 pt-8">
                   <details className="cursor-pointer group">
                     <summary className="flex items-center justify-center space-x-2 text-sm font-medium text-amber-700 hover:text-amber-800 transition-colors">
-                      <Code className="h-4 w-4" />
-                      <span>Developer Access</span>
+                      <Lock className="h-4 w-4" />
+                      <span>Sign in with email & password</span>
                       <ArrowRight className="h-3 w-3 group-open:rotate-90 transition-transform" />
                     </summary>
                     <div className="mt-6 p-6 bg-amber-50 rounded-xl border border-amber-200">
@@ -233,7 +234,7 @@ const LoginPage = () => {
                         <div className="inline-flex items-center justify-center w-10 h-10 bg-amber-100 rounded-full mb-2">
                           <Lock className="h-5 w-5 text-amber-600" />
                         </div>
-                        <h4 className="text-sm font-semibold text-amber-900">Admin Login</h4>
+                        <h4 className="text-sm font-semibold text-amber-900">Email & Password Sign-In</h4>
                       </div>
                       <form onSubmit={handleSubmit} className="space-y-4">
                         <div className="space-y-2">

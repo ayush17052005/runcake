@@ -11,9 +11,53 @@ const targetGroupsRoutes = require('./routes/targetGroups')
 const iamCredentialsRoutes = require('./routes/iamCredentials')
 const auditLogsRoutes = require('./routes/auditLogs')
 const runnersRoutes = require('./routes/runners')
+const businessCaseCreatorRoutes = require('./routes/businessCaseCreator')
 
 // Initialize database
 require('./database/db')
+
+// Ensure system-owned script rows exist for features that need them as
+// FK targets for audit logs (Business Case Creator). Idempotent.
+const { ensureSystemScripts } = require('./services/systemScripts')
+ensureSystemScripts()
+
+// One-time bootstrap: if BOOTSTRAP_ADMIN_EMAIL + BOOTSTRAP_ADMIN_PASSWORD are
+// set, upsert that user as an admin with that password. Used to seed/reset an
+// admin login on a fresh deploy before Google OAuth is wired up. Unset both
+// env vars after first successful sign-in.
+;(async () => {
+  const email = process.env.BOOTSTRAP_ADMIN_EMAIL
+  const password = process.env.BOOTSTRAP_ADMIN_PASSWORD
+  if (!email || !password) return
+  try {
+    const bcrypt = require('bcryptjs')
+    const { db } = require('./database/db')
+    const WorkspaceService = require('./services/workspaceService')
+    const hash = await bcrypt.hash(password, 12)
+    const workspace = WorkspaceService.isWorkspaceInitialized()
+      ? WorkspaceService.getWorkspace()
+      : null
+    const workspaceId = workspace?.id || null
+    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email)
+    if (existing) {
+      db.prepare(`
+        UPDATE users
+        SET password_hash = ?, role = 'admin', is_active = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(hash, existing.id)
+      console.log(`✅ Bootstrap: reset password for existing admin ${email}`)
+    } else {
+      const name = email.split('@')[0]
+      db.prepare(`
+        INSERT INTO users (email, password_hash, name, role, workspace_id, is_active)
+        VALUES (?, ?, ?, 'admin', ?, 1)
+      `).run(email, hash, name, workspaceId)
+      console.log(`✅ Bootstrap: created admin ${email}`)
+    }
+  } catch (e) {
+    console.error('❌ Bootstrap admin failed:', e.message)
+  }
+})()
 
 const app = express()
 
@@ -41,11 +85,17 @@ app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true)
-   
-    // Strip http:// and https:// from the origin
-    const strippedOrigin = origin.replace(/^https?:\/\//, '')
-    
-    if (config.cors.allowedOrigins.indexOf(strippedOrigin) !== -1) {
+
+    // Wildcard: allow any origin
+    if (config.cors.allowedOrigins.includes('*')) return callback(null, true)
+
+    // Normalize by stripping http:// and https:// from both the incoming
+    // origin and the allowed list, so entries with or without a protocol match.
+    const strip = (o) => o.replace(/^https?:\/\//, '')
+    const strippedOrigin = strip(origin)
+    const allowed = config.cors.allowedOrigins.map(strip)
+
+    if (allowed.indexOf(strippedOrigin) !== -1) {
       callback(null, true)
     } else {
       callback(new Error('Not allowed by CORS'))
@@ -82,6 +132,7 @@ app.use('/api/target-groups', targetGroupsRoutes)
 app.use('/api/iam-credentials', iamCredentialsRoutes)
 app.use('/api/audit-logs', auditLogsRoutes)
 app.use('/api/runners', runnersRoutes)
+app.use('/api/business-case-creator', businessCaseCreatorRoutes)
 
 // 404 handler
 app.use('*', (req, res) => {

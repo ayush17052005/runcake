@@ -20,6 +20,31 @@ import {
 } from 'lucide-react'
 import { auditLogsAPI } from '../lib/api'
 
+// Pull the last JSON result emitted by a BCC Ruby script. The combined script
+// ends with `BCC_RESULT_JSON={...}`; the read-only preview ends with
+// `BCC_PREVIEW_JSON={...}`. Returns { kind, data } or null.
+const extractBccResult = (output) => {
+  if (typeof output !== 'string') return null
+  const result = output.match(/BCC_RESULT_JSON=(\{[\s\S]*?\})\s*$/m)
+  if (result) {
+    try { return { kind: 'orchestrate', data: JSON.parse(result[1]) } } catch { /* fall through */ }
+  }
+  const preview = output.match(/BCC_PREVIEW_JSON=(\{[\s\S]*?\})\s*$/m)
+  if (preview) {
+    try { return { kind: 'preview', data: JSON.parse(preview[1]) } } catch { /* fall through */ }
+  }
+  return null
+}
+
+// Decide what type of BCC entry this is, based on the template_variables blob
+// that the backend stored when it kicked off the SSM run.
+const classifyBccEntry = (tv) => {
+  if (!tv || typeof tv !== 'object') return null
+  if (tv.kind === 'preview_metrics') return 'preview'
+  if ('problem_id' in tv) return tv.mode === 'existing' ? 'associate-existing' : 'create'
+  return null
+}
+
 const AuditLogPage = () => {
   const [auditLogs, setAuditLogs] = useState([])
   const [loading, setLoading] = useState(true)
@@ -632,6 +657,117 @@ const AuditLogPage = () => {
                         </div>
                       </div>
                     </div>
+
+                    {/* BCC-specific structured details. Falls back silently
+                        for regular script executions. */}
+                    {(() => {
+                      const tv = log.template_variables || {}
+                      const kind = classifyBccEntry(tv)
+                      if (!kind) return null
+                      const bccResult = extractBccResult(log.output)
+                      return (
+                        <div className="space-y-4">
+                          <div className="space-y-2">
+                            <h4 className="font-medium text-gray-900">
+                              {kind === 'preview'
+                                ? 'Preview inputs (Business Case Creator)'
+                                : 'Inputs (Business Case Creator)'}
+                            </h4>
+                            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm space-y-1">
+                              {kind !== 'preview' && (
+                                <>
+                                  <div className="flex justify-between gap-4">
+                                    <span className="text-gray-600">Problem ID</span>
+                                    <span className="font-medium">{tv.problem_id ?? '—'}</span>
+                                  </div>
+                                  <div className="flex justify-between gap-4">
+                                    <span className="text-gray-600">Evaluation</span>
+                                    <span className="font-medium">{tv.use_ai ? 'AI' : 'Human'}</span>
+                                  </div>
+                                  <div className="flex justify-between gap-4">
+                                    <span className="text-gray-600">Mode</span>
+                                    <span className="font-medium">
+                                      {tv.mode === 'existing' ? 'Use existing metric IDs' : 'Create new metrics'}
+                                    </span>
+                                  </div>
+                                </>
+                              )}
+                              {Array.isArray(tv.metric_ids) && tv.metric_ids.length > 0 && (
+                                <div className="flex justify-between gap-4">
+                                  <span className="text-gray-600">Metric IDs</span>
+                                  <span className="font-mono text-xs break-all text-right">
+                                    {tv.metric_ids.join(', ')}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                            {tv.rendered_ruby && (
+                              <details className="text-sm">
+                                <summary className="cursor-pointer text-blue-700 hover:text-blue-900">
+                                  Show rendered Ruby
+                                </summary>
+                                <pre className="mt-2 bg-white border border-slate-200 rounded p-2 text-xs whitespace-pre-wrap break-all max-h-64 overflow-auto">
+                                  {tv.rendered_ruby}
+                                </pre>
+                              </details>
+                            )}
+                          </div>
+
+                          {bccResult && (
+                            <div className="space-y-2">
+                              <h4 className="font-medium text-gray-900">
+                                {bccResult.kind === 'preview' ? 'Loaded metrics' : 'Result'}
+                              </h4>
+                              {bccResult.kind === 'orchestrate' && (
+                                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-sm space-y-1">
+                                  <div className="flex justify-between gap-4">
+                                    <span className="text-gray-600">Status</span>
+                                    <span className="font-medium">{bccResult.data.status}</span>
+                                  </div>
+                                  <div className="flex justify-between gap-4">
+                                    <span className="text-gray-600">Metric IDs</span>
+                                    <span className="font-mono text-xs break-all text-right">
+                                      {(bccResult.data.metric_ids || []).join(', ') || '—'}
+                                    </span>
+                                  </div>
+                                  {bccResult.data.message && (
+                                    <div className="flex justify-between gap-4">
+                                      <span className="text-gray-600">Message</span>
+                                      <span className="text-right">{bccResult.data.message}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              {bccResult.kind === 'preview' && (
+                                <div className="space-y-2">
+                                  {(bccResult.data.metrics || []).map((m) => (
+                                    <div key={m.id} className="bg-white border border-slate-200 rounded p-2 text-sm">
+                                      <div className="flex justify-between">
+                                        <span className="font-medium">{m.name}</span>
+                                        <span className="text-xs text-gray-500">
+                                          ID <strong>{m.id}</strong>
+                                          {(m.min_score != null || m.max_score != null) && (
+                                            <> · {m.min_score ?? '?'}–{m.max_score ?? '?'}</>
+                                          )}
+                                        </span>
+                                      </div>
+                                      {m.description && (
+                                        <p className="text-gray-600 mt-1 text-xs">{m.description}</p>
+                                      )}
+                                    </div>
+                                  ))}
+                                  {(bccResult.data.missing || []).length > 0 && (
+                                    <div className="text-xs text-red-700">
+                                      Not found: {(bccResult.data.missing).join(', ')}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
 
                     {/* Output */}
                     {log.output && (

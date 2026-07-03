@@ -1,18 +1,20 @@
 import { Link, useLocation, Navigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { Button } from './ui/button'
-import { 
-  Code, 
-  FileText, 
-  Target, 
-  History, 
-  LogOut, 
-  Menu, 
+import {
+  Code,
+  FileText,
+  Target,
+  History,
+  LogOut,
+  Menu,
   X,
   User,
   Key,
   Shield,
-  Play
+  Play,
+  PencilLine,
+  RefreshCw
 } from 'lucide-react'
 import { useState, useCallback } from 'react'
 import { authAPI } from '../lib/api'
@@ -27,13 +29,13 @@ const Layout = ({ children }) => {
   }
 
   const navigation = [
-    { name: 'Scripts', href: '/scripts', icon: Code },
-    // Admin-only navigation items
+    { name: 'Business Case Creator', href: '/business-case-creator', icon: FileText },
+    { name: 'Update Business Case', href: '/business-case-update', icon: PencilLine },
+    { name: 'Reevaluate Responses', href: '/business-case-reevaluate', icon: RefreshCw },
+    // Admin-only configuration for the Business Case feature
     ...(user?.role === 'admin' ? [
-      { name: 'Runners', href: '/runners', icon: Play },
       { name: 'Target Groups', href: '/targets', icon: Target },
       { name: 'IAM Credentials', href: '/iam-credentials', icon: Key },
-      { name: 'Admin Dashboard', href: '/admin', icon: Shield },
     ] : []),
     { name: 'Audit Log', href: '/audit-log', icon: History },
   ]

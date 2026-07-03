@@ -2,3 +2,7 @@
 
 */.env
 */.db
+
+# SSL certs (self-signed or Let's Encrypt) — never commit
+ssl/
+*.pem

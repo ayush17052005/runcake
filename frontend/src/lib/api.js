@@ -266,6 +266,29 @@ export const auditLogsAPI = {
   },
 }
 
+// Business Case Creator API
+export const businessCaseCreatorAPI = {
+  orchestrate: async (payload) => {
+    return apiCall('/business-case-creator/orchestrate', {
+      method: 'POST',
+      body: payload,
+    })
+  },
+
+  // Async: returns { executionId }. Poll getExecution to retrieve the
+  // `parsed.metrics` / `parsed.missing` once status='success'.
+  previewMetrics: async (payload) => {
+    return apiCall('/business-case-creator/preview-metrics', {
+      method: 'POST',
+      body: payload,
+    })
+  },
+
+  getExecution: async (executionId) => {
+    return apiCall(`/business-case-creator/executions/${executionId}`)
+  },
+}
+
 // Runners API
 export const runnersAPI = {
   getAll: async () => {

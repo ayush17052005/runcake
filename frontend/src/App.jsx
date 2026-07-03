@@ -25,6 +25,9 @@ const RunnersPage = lazyWithRetry(() => import('./pages/RunnersPage'), 'RunnersP
 const NewRunnerPage = lazyWithRetry(() => import('./pages/NewRunnerPage'), 'NewRunnerPage')
 const RunnerViewPage = lazyWithRetry(() => import('./pages/RunnerViewPage'), 'RunnerViewPage')
 const EditRunnerPage = lazyWithRetry(() => import('./pages/EditRunnerPage'), 'EditRunnerPage')
+const BusinessCaseCreatorPage = lazyWithRetry(() => import('./pages/BusinessCaseCreatorPage'), 'BusinessCaseCreatorPage')
+const BusinessCaseUpdatePage = lazyWithRetry(() => import('./pages/BusinessCaseUpdatePage'), 'BusinessCaseUpdatePage')
+const BusinessCaseReevaluatePage = lazyWithRetry(() => import('./pages/BusinessCaseReevaluatePage'), 'BusinessCaseReevaluatePage')
 
 // Admin Route Component
 const AdminRoute = ({ children }) => {
@@ -43,7 +46,7 @@ const AdminRoute = ({ children }) => {
   }
   
   if (user?.role !== 'admin') {
-    return <Navigate to="/scripts" replace />
+    return <Navigate to="/business-case-creator" replace />
   }
   
   return children
@@ -88,7 +91,7 @@ function App() {
               <LoginPage />
             </LazyWrapper>
           } />
-          <Route path="/" element={<Navigate to="/scripts" replace />} />
+          <Route path="/" element={<Navigate to="/business-case-creator" replace />} />
           <Route 
             path="/scripts" 
             element={
@@ -245,8 +248,8 @@ function App() {
               </AdminRoute>
             } 
           />
-          <Route 
-            path="/audit-log" 
+          <Route
+            path="/audit-log"
             element={
               <ProtectedRoute>
                 <Layout>
@@ -255,10 +258,46 @@ function App() {
                   </LazyWrapper>
                 </Layout>
               </ProtectedRoute>
-            } 
+            }
           />
-          <Route 
-            path="/runners" 
+          <Route
+            path="/business-case-creator"
+            element={
+              <ProtectedRoute>
+                <Layout>
+                  <LazyWrapper minimal>
+                    <BusinessCaseCreatorPage />
+                  </LazyWrapper>
+                </Layout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/business-case-update"
+            element={
+              <ProtectedRoute>
+                <Layout>
+                  <LazyWrapper minimal>
+                    <BusinessCaseUpdatePage />
+                  </LazyWrapper>
+                </Layout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/business-case-reevaluate"
+            element={
+              <ProtectedRoute>
+                <Layout>
+                  <LazyWrapper minimal>
+                    <BusinessCaseReevaluatePage />
+                  </LazyWrapper>
+                </Layout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/runners"
             element={
               <AdminRoute>
                 <Layout>

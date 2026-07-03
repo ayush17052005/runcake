@@ -2,11 +2,12 @@ const express = require('express')
 const { db } = require('../database/db')
 const { authenticateToken } = require('../middleware/auth')
 const AWSService = require('../services/awsService')
-const { 
-  extractTemplateVariables, 
-  processTemplate, 
-  validateVariableNames, 
-  getTemplateVariableInfo 
+const { isSystemScriptName } = require('../services/systemScripts')
+const {
+  extractTemplateVariables,
+  processTemplate,
+  validateVariableNames,
+  getTemplateVariableInfo
 } = require('../utils/templateProcessor')
 
 const router = express.Router()
@@ -19,13 +20,14 @@ router.get('/', authenticateToken, (req, res) => {
       FROM scripts s
       LEFT JOIN users u ON s.created_by = u.id
       LEFT JOIN runners r ON s.runner_id = r.id
+      WHERE s.name NOT LIKE '__system__%'
     `
-    
+
     // Non-admin users can only see member_allowed scripts
     if (req.user.role !== 'admin') {
-      query += ` WHERE s.permission_level = 'member_allowed'`
+      query += ` AND s.permission_level = 'member_allowed'`
     }
-    
+
     query += ` ORDER BY s.created_at DESC`
     
     const scripts = db.prepare(query).all()
@@ -225,11 +227,18 @@ router.put('/:id', authenticateToken, (req, res) => {
     const { id } = req.params
     const { name, description, content, tags, runner_id, permission_level = 'member_allowed' } = req.body
 
-    const existingScript = db.prepare('SELECT created_by FROM scripts WHERE id = ?').get(id)
+    const existingScript = db.prepare('SELECT created_by, name FROM scripts WHERE id = ?').get(id)
     if (!existingScript) {
       return res.status(404).json({
         success: false,
         message: 'Script not found'
+      })
+    }
+
+    if (isSystemScriptName(existingScript.name)) {
+      return res.status(403).json({
+        success: false,
+        message: 'System-owned scripts cannot be edited.'
       })
     }
 
@@ -289,11 +298,18 @@ router.delete('/:id', authenticateToken, (req, res) => {
   try {
     const { id } = req.params
 
-    const existingScript = db.prepare('SELECT created_by FROM scripts WHERE id = ?').get(id)
+    const existingScript = db.prepare('SELECT created_by, name FROM scripts WHERE id = ?').get(id)
     if (!existingScript) {
       return res.status(404).json({
         success: false,
         message: 'Script not found'
+      })
+    }
+
+    if (isSystemScriptName(existingScript.name)) {
+      return res.status(403).json({
+        success: false,
+        message: 'System-owned scripts cannot be deleted.'
       })
     }
 

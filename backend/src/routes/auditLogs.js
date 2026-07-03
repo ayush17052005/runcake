@@ -1,8 +1,19 @@
 const express = require('express')
 const { db } = require('../database/db')
 const { authenticateToken } = require('../middleware/auth')
+const { toDisplayName } = require('../services/systemScripts')
 
 const router = express.Router()
+
+// Rewrite internal __system__ names to user-facing display names
+// for anything surfaced to the UI.
+const rewriteSystemNames = (row) => {
+  if (!row) return row
+  const out = { ...row }
+  if ('script_name' in out) out.script_name = toDisplayName(out.script_name)
+  if ('target_group_name' in out) out.target_group_name = toDisplayName(out.target_group_name)
+  return out
+}
 
 // Get all audit logs with pagination
 router.get('/', authenticateToken, (req, res) => {
@@ -52,7 +63,7 @@ router.get('/', authenticateToken, (req, res) => {
     
     const auditLogs = db.prepare(dataQuery).all(...params, parsedLimit, parsedOffset)
 
-    const logsWithParsedData = auditLogs.map(log => ({
+    const logsWithParsedData = auditLogs.map(log => rewriteSystemNames({
       ...log,
       instance_ids: log.instance_ids ? JSON.parse(log.instance_ids) : [],
       template_variables: log.template_variables ? JSON.parse(log.template_variables) : {}
@@ -110,10 +121,10 @@ router.get('/:id', authenticateToken, (req, res) => {
 
     res.json({
       success: true,
-      data: {
+      data: rewriteSystemNames({
         ...auditLog,
         instance_ids: auditLog.instance_ids ? JSON.parse(auditLog.instance_ids) : []
-      }
+      })
     })
   } catch (error) {
     console.error('Error fetching audit log:', error)
@@ -234,7 +245,7 @@ router.get('/stats/overview', authenticateToken, (req, res) => {
             ((overallStats.successful / overallStats.total) * 100).toFixed(1) : 0
         },
         dailyTrends: last7Days,
-        topScripts: topScripts,
+        topScripts: topScripts.map(s => ({ ...s, script_name: toDisplayName(s.script_name) })),
         topUsers: topUsers,
         hourlyDistribution: hourlyData
       }
