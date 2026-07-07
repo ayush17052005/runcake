@@ -111,7 +111,10 @@ const SSM_MAX_POLLS = 120 // ~10 minutes
 
 // Fire-and-forget: sends combined Ruby to AWS SSM and polls until terminal.
 // Updates the script_executions row so frontend polling sees progress.
-const runSsmExecution = async ({ executionId, targetGroup, rubyContent }) => {
+// wait=false → fire-and-forget: dispatch the SSM command, record the command
+// id, and return without polling for completion (used by Reevaluate, which
+// enqueues background jobs and doesn't wait on results).
+const runSsmExecution = async ({ executionId, targetGroup, rubyContent, wait = true }) => {
   try {
     db.prepare("UPDATE script_executions SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?").run(executionId)
 
@@ -138,6 +141,9 @@ const runSsmExecution = async ({ executionId, targetGroup, rubyContent }) => {
       SET instance_ids = ?, command_id = ?
       WHERE id = ?
     `).run(JSON.stringify(commandResult.instanceIds), commandResult.commandId, executionId)
+
+    // Fire-and-forget: command dispatched, don't poll for completion.
+    if (!wait) return
 
     for (let attempt = 0; attempt < SSM_MAX_POLLS; attempt++) {
       await new Promise((r) => setTimeout(r, SSM_POLL_INTERVAL_MS))
@@ -185,6 +191,82 @@ const runSsmExecution = async ({ executionId, targetGroup, rubyContent }) => {
       SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(err.message || 'Unknown SSM execution error', executionId)
+  }
+}
+
+// Max emails per SSM command batch — larger lists are auto-split into batches
+// of this size, each fanned out across the instances.
+const REEVAL_BATCH_SIZE = 200
+
+// Reevaluate fan-out: auto-batch the emails into groups of REEVAL_BATCH_SIZE,
+// and for each batch, split it across ALL running instances in the target group
+// and dispatch a per-instance SSM command (round-robin — no email runs twice).
+// Fire-and-forget: commands are dispatched, then the row is marked on dispatch.
+const runReevaluateFanOut = async ({ executionId, problemId, emails, chunkSize, targetGroup }) => {
+  try {
+    db.prepare("UPDATE script_executions SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?").run(executionId)
+
+    const awsService = new AWSService({
+      access_key_id: targetGroup.access_key_id,
+      secret_access_key: targetGroup.secret_access_key,
+      region: targetGroup.region,
+    })
+
+    const instancesResult = await awsService.getInstancesByTag(targetGroup.aws_tag_key, targetGroup.aws_tag_value)
+    if (!instancesResult.success || instancesResult.instances.length === 0) {
+      throw new Error(instancesResult.error || 'No running instances found for the target group')
+    }
+    const instanceIds = instancesResult.instances.map((i) => i.instanceId)
+
+    const rails = db.prepare("SELECT id FROM runners WHERE name = 'rails'").get()
+    const runnerId = rails?.id
+
+    // Split into batches of REEVAL_BATCH_SIZE, then fan each batch out across
+    // the instances, one batch after another.
+    const dispatched = []
+    for (let start = 0; start < emails.length; start += REEVAL_BATCH_SIZE) {
+      const batch = emails.slice(start, start + REEVAL_BATCH_SIZE)
+      const batchIndex = Math.floor(start / REEVAL_BATCH_SIZE)
+
+      const buckets = Array.from({ length: instanceIds.length }, () => [])
+      batch.forEach((email, idx) => buckets[idx % instanceIds.length].push(email))
+
+      for (let i = 0; i < instanceIds.length; i++) {
+        const bucket = buckets[i]
+        if (bucket.length === 0) continue
+        const ruby = renderReevaluateResponsesScript({ problemId, emails: bucket, chunkSize })
+        // Send to this single instance ('all' over a one-element list).
+        const cmd = await awsService.executeCommand([instanceIds[i]], ruby, 'all', runnerId)
+        dispatched.push(
+          cmd.success
+            ? { batch: batchIndex, instance_id: instanceIds[i], command_id: cmd.commandId, email_count: bucket.length }
+            : { batch: batchIndex, instance_id: instanceIds[i], error: cmd.error, email_count: bucket.length }
+        )
+      }
+    }
+
+    const commandIds = dispatched.map((d) => d.command_id).filter(Boolean)
+    const anyOk = commandIds.length > 0
+    const batchCount = Math.ceil(emails.length / REEVAL_BATCH_SIZE)
+    db.prepare(`
+      UPDATE script_executions
+      SET instance_ids = ?, command_id = ?, status = ?, output = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      JSON.stringify(instanceIds),
+      commandIds.join(','),
+      anyOk ? 'success' : 'failed',
+      JSON.stringify({ instances: instanceIds.length, batches: batchCount, dispatched }, null, 2),
+      anyOk ? null : 'Failed to dispatch reevaluation to any instance',
+      executionId,
+    )
+  } catch (err) {
+    console.error('runReevaluateFanOut error:', err)
+    db.prepare(`
+      UPDATE script_executions
+      SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(err.message || 'Unknown fan-out error', executionId)
   }
 }
 
@@ -581,6 +663,7 @@ router.post('/reevaluate', authenticateToken, (req, res) => {
       message: 'emails: must be a non-empty array of valid email addresses',
     })
   }
+  // No hard cap — the fan-out auto-batches into groups of REEVAL_BATCH_SIZE.
 
   // chunk_size is optional (default 5) — batches the emails for logging only.
   let chunkSize = 5
@@ -602,13 +685,6 @@ router.post('/reevaluate', authenticateToken, (req, res) => {
     return res.status(404).json({ success: false, message: 'Target group not found' })
   }
 
-  let rubyContent
-  try {
-    rubyContent = renderReevaluateResponsesScript({ problemId, emails, chunkSize })
-  } catch (e) {
-    return res.status(400).json({ success: false, message: `Failed to render Ruby: ${e.message}` })
-  }
-
   const sys = getSystemScriptIds() || ensureSystemScripts()
   if (!sys) {
     return res.status(500).json({ success: false, message: 'System scripts not seeded yet. Try again.' })
@@ -621,20 +697,24 @@ router.post('/reevaluate', authenticateToken, (req, res) => {
   `).run(
     sys.reevaluateScriptId,
     targetGroupId,
-    EXECUTION_MODE,
+    'fan_out',
     JSON.stringify({
-      rendered_ruby: rubyContent,
       problem_id: problemId,
       email_count: emails.length,
       chunk_size: chunkSize,
       kind: 'reevaluate_responses',
+      fan_out: true,
     }),
     req.user.id,
   )
   const executionId = execResult.lastInsertRowid
 
-  runSsmExecution({
+  // Fan the emails out across ALL instances in the target group (fire-and-forget).
+  runReevaluateFanOut({
     executionId,
+    problemId,
+    emails,
+    chunkSize,
     targetGroup: {
       access_key_id: targetGroup.access_key_id,
       secret_access_key: targetGroup.secret_access_key,
@@ -642,12 +722,11 @@ router.post('/reevaluate', authenticateToken, (req, res) => {
       aws_tag_key: targetGroup.aws_tag_key,
       aws_tag_value: targetGroup.aws_tag_value,
     },
-    rubyContent,
   })
 
   return res.status(202).json({
     success: true,
-    data: { executionId, status: 'pending' },
+    data: { executionId, status: 'submitted', emailCount: emails.length },
   })
 })
 

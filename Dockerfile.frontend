@@ -1,9 +1,15 @@
-FROM node:18-alpine AS builder
+# Node 20 (not 18) — Tailwind v4's @tailwindcss/oxide@4.3.2 requires Node 20+;
+# on Node 18 npm skips its native binding (EBADENGINE) and `vite build` fails.
+# Debian slim (glibc), not alpine/musl, so the linux-x64-gnu bindings resolve.
+FROM node:20-slim AS builder
 
 WORKDIR /app
 
-COPY frontend/package*.json ./
-RUN npm ci
+# Resolve deps fresh for the build platform. Using `npm ci` with a lockfile
+# generated on a different OS triggers npm's optional-deps bug (npm/cli#4828),
+# dropping native bindings like @tailwindcss/oxide and @rollup/* on linux.
+COPY frontend/package.json ./
+RUN npm install
 
 COPY frontend/ .
 

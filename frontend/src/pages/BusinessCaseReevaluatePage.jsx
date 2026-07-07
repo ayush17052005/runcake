@@ -1,12 +1,12 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import { businessCaseCreatorAPI, targetGroupsAPI } from '../lib/api'
 import { Button } from '../components/ui/button'
-import { Input } from '../components/ui/input'
 import { Card } from '../components/ui/card'
 import ProblemSearchSelect from '../components/ProblemSearchSelect'
 import PreviewPanel, { PreviewRow } from '../components/PreviewPanel'
-import { CheckCircle, Loader2, AlertCircle, ChevronDown, ChevronUp, Info } from 'lucide-react'
+import { CheckCircle, Loader2, AlertCircle, Info } from 'lucide-react'
 
+const BATCH_SIZE = 200
 const EMAIL_RE = /^[^\s@<>[\]"']+@[^\s@<>[\]"']+\.[^\s@<>[\]"']+$/
 
 // Parse a comma/space/newline-separated blob of emails into { emails, invalid }.
@@ -19,9 +19,8 @@ const parseEmails = (raw) => {
   const invalid = []
   const seen = new Set()
   for (const t of tokens) {
-    if (!EMAIL_RE.test(t)) {
-      invalid.push(t)
-    } else if (!seen.has(t)) {
+    if (!EMAIL_RE.test(t)) invalid.push(t)
+    else if (!seen.has(t)) {
       seen.add(t)
       emails.push(t)
     }
@@ -29,47 +28,21 @@ const parseEmails = (raw) => {
   return { emails, invalid }
 }
 
-const ProgressPanel = ({ status, errorMessage }) => (
-  <Card className="p-6 space-y-3">
-    <div className="flex items-center gap-3">
-      <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
-      <div>
-        <h3 className="text-lg font-semibold text-slate-900">Reevaluating on EC2 via SSM</h3>
-        <p className="text-sm text-slate-600">
-          Status: <strong>{status}</strong>. Reevaluation runs the AI judge per response — this can
-          take several minutes. Don't close the tab.
-        </p>
-      </div>
-    </div>
-    {errorMessage && (
-      <div className="flex items-start gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-md p-3">
-        <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
-        <span>{errorMessage}</span>
-      </div>
-    )}
-  </Card>
-)
-
 const BusinessCaseReevaluatePage = () => {
   const [selectedProblem, setSelectedProblem] = useState(null)
   const [targetGroups, setTargetGroups] = useState([])
   const [targetGroupId, setTargetGroupId] = useState('')
   const [emailsInput, setEmailsInput] = useState('')
-  const [chunkSize, setChunkSize] = useState(5)
 
-  // "Fetch emails for problem" (runs the candidate-emails SQL on Rails).
+  // "Fetch emails for problem" (Metabase)
   const [fetchLoading, setFetchLoading] = useState(false)
   const [fetchError, setFetchError] = useState(null)
   const [fetchInfo, setFetchInfo] = useState(null)
 
   const [formErrors, setFormErrors] = useState({})
-  const [execution, setExecution] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState(null)
   const [result, setResult] = useState(null)
-  const [outputOpen, setOutputOpen] = useState(false)
-
-  const pollRef = useRef(null)
 
   useEffect(() => {
     let cancelled = false
@@ -83,14 +56,12 @@ const BusinessCaseReevaluatePage = () => {
     })()
     return () => {
       cancelled = true
-      if (pollRef.current) clearInterval(pollRef.current)
     }
   }, [])
 
   const { emails, invalid } = useMemo(() => parseEmails(emailsInput), [emailsInput])
+  const batchCount = Math.max(1, Math.ceil(emails.length / BATCH_SIZE))
 
-  // Fetch candidate emails for the problem from Metabase and drop them into the
-  // textarea. Only needs a problem id — the query runs against Metabase, not Rails.
   const handleFetchEmails = async () => {
     setFetchError(null)
     setFetchInfo(null)
@@ -98,23 +69,20 @@ const BusinessCaseReevaluatePage = () => {
       setFetchError('Search and select a problem first')
       return
     }
-
     setFetchLoading(true)
     try {
-      const resp = await businessCaseCreatorAPI.fetchCandidateEmails({
-        problem_id: selectedProblem.id,
-      })
+      const resp = await businessCaseCreatorAPI.fetchCandidateEmails({ problem_id: selectedProblem.id })
       if (!resp?.success) {
         setFetchError(resp?.message || 'Failed to fetch emails')
         return
       }
-      const fetched = resp.data?.emails || []
-      setEmailsInput(fetched.join('\n'))
+      const all = resp.data?.emails || []
+      setEmailsInput(all.join('\n'))
       setFormErrors((p) => ({ ...p, emails: undefined }))
       setFetchInfo(
-        fetched.length > 0
-          ? `Loaded ${fetched.length} candidate email${fetched.length === 1 ? '' : 's'} from Metabase`
-          : 'No candidate emails found for this problem'
+        all.length === 0
+          ? 'No candidate emails found for this problem'
+          : `Loaded ${all.length} candidate email${all.length === 1 ? '' : 's'} from Metabase`
       )
     } catch (e) {
       setFetchError(e.message || 'Failed to fetch emails')
@@ -123,60 +91,16 @@ const BusinessCaseReevaluatePage = () => {
     }
   }
 
-  const startPollingExecution = (executionId) => {
-    if (pollRef.current) clearInterval(pollRef.current)
-    const poll = async () => {
-      try {
-        const resp = await businessCaseCreatorAPI.getExecution(executionId)
-        if (!resp?.success) return
-        setExecution({
-          executionId: resp.data.executionId,
-          status: resp.data.status,
-          errorMessage: resp.data.errorMessage,
-        })
-        if (resp.data.isTerminal) {
-          clearInterval(pollRef.current)
-          pollRef.current = null
-          const parsed = resp.data.parsed
-          if (resp.data.status === 'success' && parsed && parsed.status === 'success') {
-            setResult({
-              problemId: parsed.problem_id,
-              total: parsed.total ?? 0,
-              okCount: parsed.ok_count ?? 0,
-              errorCount: parsed.error_count ?? 0,
-              output: resp.data.output || '',
-            })
-            setExecution(null)
-          } else {
-            setSubmitError(resp.data.errorMessage || parsed?.message || 'Reevaluation failed')
-          }
-        }
-      } catch (e) {
-        console.error('Polling error:', e)
-      }
-    }
-    poll()
-    pollRef.current = setInterval(poll, 3000)
-  }
-
   const handleSubmit = async () => {
     setSubmitError(null)
     const errors = {}
 
-    if (!selectedProblem) {
-      errors.problem = 'Search and select a problem'
-    }
-    if (!targetGroupId) {
-      errors.targetGroupId = 'Select a target group'
-    }
+    if (!selectedProblem) errors.problem = 'Search and select a problem'
+    if (!targetGroupId) errors.targetGroupId = 'Select a target group'
     if (invalid.length > 0) {
       errors.emails = `Invalid email${invalid.length === 1 ? '' : 's'}: ${invalid.slice(0, 5).join(', ')}${invalid.length > 5 ? '…' : ''}`
     } else if (emails.length === 0) {
       errors.emails = 'Enter at least one candidate email'
-    }
-    const cs = Number(chunkSize)
-    if (!Number.isInteger(cs) || cs <= 0) {
-      errors.chunkSize = 'Must be a positive integer'
     }
 
     setFormErrors(errors)
@@ -188,14 +112,17 @@ const BusinessCaseReevaluatePage = () => {
         problem_id: selectedProblem.id,
         target_group_id: Number(targetGroupId),
         emails,
-        chunk_size: cs,
       })
       if (!resp?.success) {
         setSubmitError(resp?.message || 'Failed to start')
         return
       }
-      setExecution({ executionId: resp.data.executionId, status: resp.data.status })
-      startPollingExecution(resp.data.executionId)
+      // Fire-and-forget — no polling. Reevaluations run as background jobs.
+      setResult({
+        problemLabel: selectedProblem.label,
+        problemId: selectedProblem.id,
+        count: resp.data?.emailCount ?? emails.length,
+      })
     } catch (e) {
       setSubmitError(e.message || 'Failed to start')
     } finally {
@@ -207,31 +134,24 @@ const BusinessCaseReevaluatePage = () => {
     setSelectedProblem(null)
     setTargetGroupId('')
     setEmailsInput('')
-    setChunkSize(5)
     setFetchError(null)
     setFetchInfo(null)
     setFetchLoading(false)
     setFormErrors({})
-    setExecution(null)
     setSubmitError(null)
     setResult(null)
-    setOutputOpen(false)
-    if (pollRef.current) {
-      clearInterval(pollRef.current)
-      pollRef.current = null
-    }
   }
 
-  const showForm = !execution && !result
+  const showForm = !result
 
   return (
     <div className="py-8 px-4 sm:px-6 lg:px-8 max-w-5xl mx-auto space-y-6">
       <div>
         <h1 className="text-3xl font-bold text-slate-900">Reevaluate Responses</h1>
         <p className="text-slate-600 mt-1">
-          Re-run the SmartJudge AI evaluation for every candidate response of a business-case
-          problem. Emails are processed in batches on a randomly-picked Rails instance; scores are
-          recomputed per response.
+          Queue the SmartJudge AI reevaluation for a problem's candidate responses. Emails are split
+          across all instances in the target group and enqueued as background jobs — scores update
+          as they run. Large lists are auto-batched in groups of {BATCH_SIZE}.
         </p>
       </div>
 
@@ -239,31 +159,17 @@ const BusinessCaseReevaluatePage = () => {
         <Card className="p-6 space-y-3 border-green-200 bg-green-50">
           <div className="flex items-center gap-2 text-green-900">
             <CheckCircle className="h-5 w-5" />
-            <h3 className="text-lg font-semibold">Reevaluation complete</h3>
+            <h3 className="text-lg font-semibold">Reevaluation submitted</h3>
           </div>
           <div className="text-sm text-green-900 space-y-1">
-            <div>Problem ID: <strong>{result.problemId}</strong></div>
-            <div>Total processed: <strong>{result.total}</strong></div>
-            <div>Succeeded: <strong>{result.okCount}</strong></div>
-            <div>Failed: <strong>{result.errorCount}</strong></div>
+            <div>Problem: <strong>{result.problemLabel}</strong> (ID {result.problemId})</div>
+            <div>Responses queued: <strong>{result.count}</strong></div>
           </div>
-          {result.output && (
-            <div>
-              <button
-                type="button"
-                onClick={() => setOutputOpen((v) => !v)}
-                className="flex items-center gap-1 text-sm text-green-800 hover:text-green-950"
-              >
-                {outputOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-                Per-email details
-              </button>
-              {outputOpen && (
-                <pre className="mt-2 bg-white border border-green-200 rounded p-2 text-xs whitespace-pre-wrap break-all max-h-96 overflow-auto">
-                  {result.output}
-                </pre>
-              )}
-            </div>
-          )}
+          <p className="text-sm text-green-900">
+            The emails were split across all instances in the target group (in batches of {BATCH_SIZE})
+            and dispatched to run in the background — this can take a while, and scores update as each
+            job completes. You can safely leave this page.
+          </p>
           <div className="flex gap-2">
             <Button variant="outline" onClick={handleReset}>Reevaluate another</Button>
             <a href="/audit-log" className="inline-flex">
@@ -271,10 +177,6 @@ const BusinessCaseReevaluatePage = () => {
             </a>
           </div>
         </Card>
-      )}
-
-      {execution && !result && (
-        <ProgressPanel status={execution.status} errorMessage={execution.errorMessage || submitError} />
       )}
 
       {showForm && (
@@ -320,7 +222,7 @@ const BusinessCaseReevaluatePage = () => {
                 size="sm"
                 onClick={handleFetchEmails}
                 disabled={fetchLoading || !selectedProblem}
-                title="Fetch emails of users with evaluation responses for this problem"
+                title="Fetch emails of users with responses for this problem"
               >
                 {fetchLoading ? (
                   <>
@@ -337,9 +239,7 @@ const BusinessCaseReevaluatePage = () => {
                 <span>{fetchError}</span>
               </div>
             )}
-            {fetchInfo && !fetchError && (
-              <p className="mb-2 text-xs text-green-700">{fetchInfo}</p>
-            )}
+            {fetchInfo && !fetchError && <p className="mb-2 text-xs text-green-700">{fetchInfo}</p>}
             <textarea
               value={emailsInput}
               onChange={(e) => {
@@ -350,49 +250,25 @@ const BusinessCaseReevaluatePage = () => {
               rows={6}
               className="block w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
-            <div className="flex items-center justify-between mt-1">
-              {formErrors.emails ? (
-                <p className="text-sm text-red-600">{formErrors.emails}</p>
-              ) : (
-                <p className="text-xs text-slate-500">
-                  Comma-, space- or newline-separated.{' '}
-                  {emails.length > 0 && (
-                    <span className="text-slate-700">{emails.length} valid email{emails.length === 1 ? '' : 's'}</span>
-                  )}
-                  {invalid.length > 0 && (
-                    <span className="text-red-600"> · {invalid.length} invalid</span>
-                  )}
-                </p>
-              )}
-            </div>
+            {formErrors.emails ? (
+              <p className="text-sm text-red-600 mt-1">{formErrors.emails}</p>
+            ) : (
+              <p className="text-xs mt-1 text-slate-500">
+                Comma-, space- or newline-separated.{' '}
+                <span className="text-slate-700">
+                  {emails.length} email{emails.length === 1 ? '' : 's'}
+                  {emails.length > BATCH_SIZE && ` · ${batchCount} batches of ${BATCH_SIZE}`}
+                </span>
+                {invalid.length > 0 && <span className="text-red-600"> · {invalid.length} invalid</span>}
+              </p>
+            )}
             <div className="mt-2 flex items-start gap-2 text-xs text-blue-800 bg-blue-50 border border-blue-200 rounded-md p-2">
               <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
               <span>
-                Interim input — this list will be auto-populated from Metabase (users with evaluation
-                responses for the problem) once that integration lands.
+                Use “Fetch emails for problem” to pull the candidate list from Metabase. Any number is
+                accepted — lists over {BATCH_SIZE} are auto-batched and fanned out across the instances.
               </span>
             </div>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Batch size</label>
-            <Input
-              type="number"
-              value={chunkSize}
-              onChange={(e) => {
-                setChunkSize(e.target.value)
-                setFormErrors((p) => ({ ...p, chunkSize: undefined }))
-              }}
-              min="1"
-              className="w-28"
-            />
-            {formErrors.chunkSize ? (
-              <p className="text-sm text-red-600 mt-1">{formErrors.chunkSize}</p>
-            ) : (
-              <p className="text-xs text-slate-500 mt-1">
-                How many emails to log per batch (default 5). All emails are processed in one run.
-              </p>
-            )}
           </div>
 
           {(selectedProblem || emails.length > 0) && (
@@ -408,11 +284,12 @@ const BusinessCaseReevaluatePage = () => {
               </PreviewRow>
               <PreviewRow label="Responses to reevaluate">
                 {emails.length} candidate email{emails.length === 1 ? '' : 's'}
-                {invalid.length > 0 && <span className="text-red-600"> · {invalid.length} invalid (fix before submit)</span>}
+                {emails.length > BATCH_SIZE && ` · ${batchCount} batches of ${BATCH_SIZE}`}
+                {invalid.length > 0 && <span className="text-red-600"> · {invalid.length} invalid</span>}
               </PreviewRow>
-              <PreviewRow label="Batch size">{chunkSize}</PreviewRow>
               <PreviewRow label="Action">
-                Re-runs the SmartJudge AI evaluation for every email and recomputes scores.
+                Splits the emails across all instances in the target group and enqueues a background
+                SmartJudge reevaluation per email; scores update as jobs run.
               </PreviewRow>
             </PreviewPanel>
           )}
@@ -428,10 +305,10 @@ const BusinessCaseReevaluatePage = () => {
             <Button onClick={handleSubmit} disabled={submitting}>
               {submitting ? (
                 <>
-                  <Loader2 className="h-4 w-4 mr-1 animate-spin" /> Starting...
+                  <Loader2 className="h-4 w-4 mr-1 animate-spin" /> Submitting...
                 </>
               ) : (
-                'Reevaluate all responses'
+                'Reevaluate responses'
               )}
             </Button>
           </div>

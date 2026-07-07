@@ -427,14 +427,12 @@ const renderUpdateBusinessCaseScript = ({ problemId, removeMetricIds, metrics, a
 
 // --- Reevaluate responses ---------------------------------------------------
 //
-// Re-runs the SmartJudge business-case evaluation for every candidate response
-// of a problem. Emails are sliced into chunks (chunk_size, default 5) purely
-// for batched logging; unlike the reference one-shot, this loops over ALL
-// chunks so every email is processed in a single SSM run. The per-email body
-// is the exact reference logic (find IBTSP, keep one AI evaluator association,
-// archive the rest, run EvaluateService, recompute scores). Per-email failures
-// are captured and do not abort the run. Emits BCC_RESULT_JSON (compact — the
-// full per-email table is in stdout) so the existing poller handles it.
+// Re-runs the SmartJudge business-case evaluation for candidate responses of a
+// problem. For each email it finds the IBTSP, keeps one AI evaluator
+// association, archives the rest, resets status, then ENQUEUES the evaluation
+// via EvaluateService.execute_later (runs in the background). It still logs each
+// email's old/new score and a success/error status to stdout. The backend fires
+// this without polling. Per-email failures are captured and do not abort the run.
 const REEVALUATE_RESPONSES_SCRIPT_RUBY = `require 'json'
 
 problem_id = {{problem_id}}
@@ -448,7 +446,7 @@ result_summary = {
   problem_id: problem_id,
   status: 'failed',
   total: emails.size,
-  ok_count: 0,
+  success_count: 0,
   error_count: 0,
   message: nil
 }
@@ -511,13 +509,14 @@ begin
 
         keep.update!(evaluation_status: :started) if keep.completed? || keep.archived?
 
-        eval_result = EvaluationEntities::SmartJudge::EvaluateService.execute(
+        # Enqueue the evaluation to run in the background (execute_later) instead
+        # of running it inline. The job recomputes scores when it runs; we still
+        # log the current old/new score and mark dispatch success.
+        EvaluationEntities::SmartJudge::EvaluateService.execute_later(
           evaluation_entity_id: ee.id,
           evaluation_id: keep.id,
           retry_count: 0
         )
-
-        raise "Evaluation failed: #{eval_result.inspect}" unless eval_result["success"] || eval_result[:success]
 
         ibtsp.reload
         new_score = ibtsp.cumulative_crowd_evaluation_score(options: { created_at: ee.created_at }, with_decay: true)
@@ -536,10 +535,10 @@ begin
           new_score: ibtsp.reload.score,
           session_id: session.id,
           session_score: session.reload.score,
-          status: "ok"
+          status: "success"
         }
 
-        puts "OK #{email}: #{old_score} -> #{ibtsp.score}"
+        puts "SUCCESS #{email}: #{old_score} -> #{ibtsp.score}"
       rescue => e
         results << { email: email, status: "error", error: "#{e.class}: #{e.message}" }
         puts "ERROR #{email}: #{e.class}: #{e.message}"
@@ -562,7 +561,7 @@ begin
     ].join("\\t")
   end
 
-  result_summary[:ok_count] = results.count { |r| r[:status] == "ok" }
+  result_summary[:success_count] = results.count { |r| r[:status] == "success" }
   result_summary[:error_count] = results.count { |r| r[:status] == "error" }
   result_summary[:status] = 'success'
 rescue => e
