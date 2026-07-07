@@ -1,17 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { businessCaseCreatorAPI, targetGroupsAPI } from '../lib/api'
+import ProblemSearchSelect from '../components/ProblemSearchSelect'
+import MetricSearchSelect from '../components/MetricSearchSelect'
+import PreviewPanel, { PreviewRow } from '../components/PreviewPanel'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Card } from '../components/ui/card'
-import {
-  Plus,
-  Trash2,
-  CheckCircle,
-  ChevronDown,
-  ChevronUp,
-  Loader2,
-  AlertCircle,
-} from 'lucide-react'
+import { Plus, Trash2, CheckCircle, Loader2, AlertCircle } from 'lucide-react'
 
 const emptyMetric = () => ({ title: '', description: '', min_marks: 0, max_marks: 10 })
 
@@ -21,40 +16,22 @@ const formatMetricsPreview = (metrics) =>
     .map((m) => `${m.title.trim()}: ${m.description.trim()}`)
     .join('\n')
 
-// Parse a comma/space/newline-separated string of metric IDs. Returns
-// { ids, error } — error is non-null when input is malformed or contains
-// non-positive-integer tokens.
-const parseMetricIdsInput = (raw) => {
-  const trimmed = String(raw || '').trim()
-  if (!trimmed) return { ids: [], error: 'Enter at least one metric ID' }
-  const tokens = trimmed.split(/[\s,]+/).filter(Boolean)
-  const ids = []
-  for (const t of tokens) {
-    if (!/^\d+$/.test(t)) return { ids: [], error: `"${t}" is not a positive integer` }
-    const n = Number(t)
-    if (!Number.isFinite(n) || n <= 0) return { ids: [], error: `"${t}" is not a positive integer` }
-    ids.push(n)
-  }
-  return { ids: Array.from(new Set(ids)), error: null }
-}
-
-const validateClientSide = ({ problemId, mode, metrics, metricIds, targetGroupId }) => {
+const validateClientSide = ({ selectedProblem, mode, metrics, existingCount, targetGroupId }) => {
   const errors = { metrics: (metrics || []).map(() => ({})) }
   let hasError = false
 
-  if (!problemId || !/^\d+$/.test(String(problemId).trim()) || Number(problemId) <= 0) {
-    errors.problemId = 'Must be a positive integer'
+  if (!selectedProblem) {
+    errors.problem = 'Search and select a problem'
     hasError = true
   }
-
   if (!targetGroupId) {
     errors.targetGroupId = 'Select a target group'
     hasError = true
   }
 
   if (mode === 'existing') {
-    if (!Array.isArray(metricIds) || metricIds.length === 0) {
-      errors.metricIdsRoot = 'Enter at least one metric ID and load the preview before starting'
+    if (!existingCount) {
+      errors.existingRoot = 'Search and add at least one metric'
       hasError = true
     }
     return { hasError, errors }
@@ -128,23 +105,15 @@ const ProgressPanel = ({ status, errorMessage }) => (
 )
 
 const BusinessCaseCreatorPage = () => {
-  const [problemId, setProblemId] = useState('')
+  const [selectedProblem, setSelectedProblem] = useState(null)
   const [targetGroups, setTargetGroups] = useState([])
   const [targetGroupId, setTargetGroupId] = useState('')
-  // 'create' (new metrics inline) or 'existing' (look up by id)
+  // 'create' (new metrics inline) or 'existing' (search + associate)
   const [metricsMode, setMetricsMode] = useState('create')
   const [metrics, setMetrics] = useState([emptyMetric()])
-  // Map-existing mode state. Raw textarea contents + parsed/loaded results.
-  const [metricIdsInput, setMetricIdsInput] = useState('')
-  const [loadedMetricIds, setLoadedMetricIds] = useState([])
-  const [previewMetrics, setPreviewMetrics] = useState([]) // [{ id, name, description, min_score, max_score }]
-  const [previewMissingIds, setPreviewMissingIds] = useState([])
-  const [previewLoading, setPreviewLoading] = useState(false)
-  const [previewError, setPreviewError] = useState(null)
-  const previewPollRef = useRef(null)
+  const [selectedExisting, setSelectedExisting] = useState([]) // [{ id, name, description }]
 
   const [useAi, setUseAi] = useState(false)
-  const [previewOpen, setPreviewOpen] = useState(false)
   const [formErrors, setFormErrors] = useState({ metrics: [{}] })
 
   const [execution, setExecution] = useState(null)
@@ -167,83 +136,11 @@ const BusinessCaseCreatorPage = () => {
     return () => {
       cancelled = true
       if (pollRef.current) clearInterval(pollRef.current)
-      if (previewPollRef.current) clearInterval(previewPollRef.current)
     }
   }, [])
 
-  // Kick off a preview-metrics SSM run, then poll the execution until it
-  // terminates. On success, populate previewMetrics + previewMissingIds.
-  const handleLoadPreview = async () => {
-    setPreviewError(null)
-    setPreviewMetrics([])
-    setPreviewMissingIds([])
-    setLoadedMetricIds([])
-
-    if (!targetGroupId) {
-      setPreviewError('Select a target group first')
-      return
-    }
-    const { ids, error } = parseMetricIdsInput(metricIdsInput)
-    if (error) {
-      setPreviewError(error)
-      return
-    }
-
-    setPreviewLoading(true)
-    try {
-      const resp = await businessCaseCreatorAPI.previewMetrics({
-        target_group_id: Number(targetGroupId),
-        metric_ids: ids,
-      })
-      if (!resp?.success) {
-        setPreviewError(resp?.message || 'Failed to start preview')
-        setPreviewLoading(false)
-        return
-      }
-      const executionId = resp.data.executionId
-      if (previewPollRef.current) clearInterval(previewPollRef.current)
-      const poll = async () => {
-        try {
-          const status = await businessCaseCreatorAPI.getExecution(executionId)
-          if (!status?.success) return
-          if (status.data.isTerminal) {
-            clearInterval(previewPollRef.current)
-            previewPollRef.current = null
-            setPreviewLoading(false)
-            const parsed = status.data.parsed
-            if (status.data.status === 'success' && parsed && parsed.status === 'success') {
-              setPreviewMetrics(parsed.metrics || [])
-              setPreviewMissingIds(parsed.missing || [])
-              const foundIds = (parsed.metrics || []).map((m) => m.id)
-              setLoadedMetricIds(foundIds)
-              if ((parsed.missing || []).length > 0) {
-                setPreviewError(
-                  `Some IDs not found on the Rails DB: ${(parsed.missing || []).join(', ')}`
-                )
-              }
-            } else {
-              setPreviewError(
-                status.data.errorMessage || parsed?.message || 'Preview failed — check audit log'
-              )
-            }
-          }
-        } catch (e) {
-          console.error('preview poll error:', e)
-        }
-      }
-      poll()
-      previewPollRef.current = setInterval(poll, 3000)
-    } catch (e) {
-      setPreviewError(e.message || 'Failed to start preview')
-      setPreviewLoading(false)
-    }
-  }
-
   const metricsPreview = useMemo(() => formatMetricsPreview(metrics), [metrics])
 
-  // Clear a single top-level form error key when the user starts editing that
-  // field. Keeps the red message from sticking around after the user has
-  // already corrected the input.
   const clearTopError = (key) => {
     setFormErrors((prev) => {
       if (!prev || prev[key] == null) return prev
@@ -318,10 +215,10 @@ const BusinessCaseCreatorPage = () => {
   const handleStart = async () => {
     setSubmitError(null)
     const { hasError, errors } = validateClientSide({
-      problemId,
+      selectedProblem,
       mode: metricsMode,
       metrics,
-      metricIds: loadedMetricIds,
+      existingCount: selectedExisting.length,
       targetGroupId,
     })
     setFormErrors(errors)
@@ -330,13 +227,13 @@ const BusinessCaseCreatorPage = () => {
     setSubmitting(true)
     try {
       const basePayload = {
-        problem_id: Number(problemId),
+        problem_id: selectedProblem.id,
         target_group_id: Number(targetGroupId),
         use_ai: useAi,
       }
       const payload =
         metricsMode === 'existing'
-          ? { ...basePayload, mode: 'existing', metric_ids: loadedMetricIds }
+          ? { ...basePayload, mode: 'existing', metric_ids: selectedExisting.map((m) => m.id) }
           : {
               ...basePayload,
               mode: 'create',
@@ -362,15 +259,11 @@ const BusinessCaseCreatorPage = () => {
   }
 
   const handleReset = () => {
-    setProblemId('')
+    setSelectedProblem(null)
     setTargetGroupId('')
     setMetricsMode('create')
     setMetrics([emptyMetric()])
-    setMetricIdsInput('')
-    setLoadedMetricIds([])
-    setPreviewMetrics([])
-    setPreviewMissingIds([])
-    setPreviewError(null)
+    setSelectedExisting([])
     setUseAi(false)
     setFormErrors({ metrics: [{}] })
     setExecution(null)
@@ -379,10 +272,6 @@ const BusinessCaseCreatorPage = () => {
     if (pollRef.current) {
       clearInterval(pollRef.current)
       pollRef.current = null
-    }
-    if (previewPollRef.current) {
-      clearInterval(previewPollRef.current)
-      previewPollRef.current = null
     }
   }
 
@@ -425,18 +314,15 @@ const BusinessCaseCreatorPage = () => {
       {showForm && (
         <Card className="p-6 space-y-6">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Design problem ID</label>
-            <Input
-              type="number"
-              value={problemId}
-              onChange={(e) => {
-                setProblemId(e.target.value)
-                clearTopError('problemId')
+            <label className="block text-sm font-medium text-slate-700 mb-1">Problem</label>
+            <ProblemSearchSelect
+              value={selectedProblem}
+              onChange={(p) => {
+                setSelectedProblem(p)
+                clearTopError('problem')
               }}
-              placeholder="e.g. 12313"
-              min="1"
+              error={formErrors.problem}
             />
-            {formErrors.problemId && <p className="text-sm text-red-600 mt-1">{formErrors.problemId}</p>}
           </div>
 
           <div>
@@ -486,7 +372,7 @@ const BusinessCaseCreatorPage = () => {
                   checked={metricsMode === 'existing'}
                   onChange={() => setMetricsMode('existing')}
                 />
-                Use existing metric IDs
+                Use existing metrics
               </label>
             </div>
 
@@ -564,136 +450,44 @@ const BusinessCaseCreatorPage = () => {
             )}
 
             {metricsMode === 'existing' && (
-              <div className="space-y-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-600 mb-1">
-                    Metric IDs (comma- or space-separated, e.g. <code>1234, 5678, 9012</code>)
-                  </label>
-                  <div className="flex gap-2">
-                    <Input
-                      placeholder="1234, 5678, 9012"
-                      value={metricIdsInput}
-                      onChange={(e) => {
-                        setMetricIdsInput(e.target.value)
-                        clearTopError('metricIdsRoot')
-                        // Force the user to re-fetch the preview after editing.
-                        if (loadedMetricIds.length > 0) {
-                          setLoadedMetricIds([])
-                          setPreviewMetrics([])
-                          setPreviewMissingIds([])
-                        }
-                      }}
-                      className="flex-1"
-                    />
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={handleLoadPreview}
-                      disabled={previewLoading || !targetGroupId}
-                    >
-                      {previewLoading ? (
-                        <>
-                          <Loader2 className="h-4 w-4 mr-1 animate-spin" /> Loading…
-                        </>
-                      ) : (
-                        'Load preview'
-                      )}
-                    </Button>
-                  </div>
-                  {!targetGroupId && (
-                    <p className="text-xs text-slate-500 mt-1">
-                      Select a target group first — the preview runs on a Rails instance.
-                    </p>
-                  )}
-                </div>
-
-                {previewError && (
-                  <div className="flex items-start gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-md p-3">
-                    <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
-                    <span>{previewError}</span>
-                  </div>
+              <>
+                {formErrors.existingRoot && (
+                  <p className="text-sm text-red-600 mb-2">{formErrors.existingRoot}</p>
                 )}
-
-                {formErrors.metricIdsRoot && (
-                  <p className="text-sm text-red-600">{formErrors.metricIdsRoot}</p>
-                )}
-
-                {previewMetrics.length > 0 && (
-                  <div className="space-y-2">
-                    <div className="text-xs text-slate-500">
-                      Loaded {previewMetrics.length} metric{previewMetrics.length === 1 ? '' : 's'}
-                      {previewMissingIds.length > 0 && (
-                        <> · {previewMissingIds.length} not found: <strong>{previewMissingIds.join(', ')}</strong></>
-                      )}
-                    </div>
-                    {previewMetrics.map((m) => (
-                      <div
-                        key={m.id}
-                        className="p-3 border border-slate-200 rounded-md bg-white"
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="font-medium text-slate-900">{m.name}</div>
-                          <div className="text-xs text-slate-500">
-                            ID <strong>{m.id}</strong>
-                            {(m.min_score != null || m.max_score != null) && (
-                              <> · {m.min_score ?? '?'}–{m.max_score ?? '?'}</>
-                            )}
-                          </div>
-                        </div>
-                        {m.description && (
-                          <p className="text-sm text-slate-600 mt-1">{m.description}</p>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+                <MetricSearchSelect selected={selectedExisting} onChange={setSelectedExisting} />
+              </>
             )}
           </div>
 
-          <div>
-            <button
-              type="button"
-              onClick={() => setPreviewOpen((v) => !v)}
-              className="flex items-center gap-1 text-sm text-blue-700 hover:text-blue-900"
-            >
-              {previewOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-              Verify preview
-            </button>
-            {previewOpen && (
-              <div className="mt-2 p-3 bg-slate-50 border border-slate-200 rounded-md">
-                {metricsMode === 'create' ? (
-                  <>
-                    <div className="text-xs text-slate-500 mb-1">
-                      Metrics string that will be sent to the Ruby script:
-                    </div>
-                    <pre className="bg-white border border-slate-200 rounded p-2 text-xs whitespace-pre-wrap break-all">
-                      {metricsPreview || '(empty)'}
-                    </pre>
-                    <div className="text-xs text-slate-600 mt-2">
-                      Problem ID: <strong>{problemId || '(unset)'}</strong> ·{' '}
-                      {metrics.length} metric{metrics.length === 1 ? '' : 's'} ·{' '}
-                      Evaluated by <strong>{useAi ? 'AI' : 'Human'}</strong>
-                    </div>
-                  </>
+          <PreviewPanel>
+            <PreviewRow label="Problem">
+              {selectedProblem ? (
+                <>
+                  {selectedProblem.label} <span className="text-slate-400">· ID {selectedProblem.id}</span>
+                </>
+              ) : (
+                <span className="text-slate-400">(not selected)</span>
+              )}
+            </PreviewRow>
+            <PreviewRow label="Evaluation">{useAi ? 'AI' : 'Human'}</PreviewRow>
+            {metricsMode === 'create' ? (
+              <PreviewRow label="New metrics">
+                {metricsPreview ? (
+                  <pre className="bg-white border border-slate-200 rounded p-2 text-xs whitespace-pre-wrap break-all">
+                    {metricsPreview}
+                  </pre>
                 ) : (
-                  <>
-                    <div className="text-xs text-slate-500 mb-1">
-                      Existing metric IDs that will be associated with the problem:
-                    </div>
-                    <pre className="bg-white border border-slate-200 rounded p-2 text-xs whitespace-pre-wrap break-all">
-                      {loadedMetricIds.length > 0 ? loadedMetricIds.join(', ') : '(load preview first)'}
-                    </pre>
-                    <div className="text-xs text-slate-600 mt-2">
-                      Problem ID: <strong>{problemId || '(unset)'}</strong> ·{' '}
-                      {loadedMetricIds.length} metric{loadedMetricIds.length === 1 ? '' : 's'} ·{' '}
-                      Evaluated by <strong>{useAi ? 'AI' : 'Human'}</strong>
-                    </div>
-                  </>
+                  <span className="text-slate-400">(none)</span>
                 )}
-              </div>
+              </PreviewRow>
+            ) : (
+              <PreviewRow label="Existing metrics">
+                {selectedExisting.length > 0
+                  ? selectedExisting.map((m) => `${m.name || `Metric ${m.id}`} (${m.id})`).join(', ')
+                  : <span className="text-slate-400">(search and add metrics)</span>}
+              </PreviewRow>
             )}
-          </div>
+          </PreviewPanel>
 
           <fieldset>
             <legend className="block text-sm font-medium text-slate-700 mb-2">Evaluation mode</legend>

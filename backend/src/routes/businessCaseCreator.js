@@ -6,6 +6,8 @@ const {
   renderCombinedScript,
   renderAssociateExistingScript,
   renderPreviewMetricsScript,
+  renderUpdateBusinessCaseScript,
+  renderReevaluateResponsesScript,
   parseCombinedResult,
   parsePreviewResult,
   validateMetric,
@@ -14,6 +16,8 @@ const {
   getSystemScriptIds,
   ensureSystemScripts,
 } = require('../services/systemScripts')
+const metabaseService = require('../services/metabaseService')
+const config = require('../../config')
 
 const router = express.Router()
 
@@ -41,6 +45,20 @@ const sanitizeMetricIds = (raw) => {
     out.push(n)
   }
   return Array.from(new Set(out)).sort((a, b) => a - b)
+}
+
+// Dedupe + validate a list of emails. Returns null if empty or any entry isn't
+// a plain email (no whitespace/brackets — they render inside a Ruby %w[] list).
+const EMAIL_RE = /^[^\s@<>[\]"']+@[^\s@<>[\]"']+\.[^\s@<>[\]"']+$/
+const sanitizeEmails = (raw) => {
+  if (!Array.isArray(raw) || raw.length === 0) return null
+  const out = []
+  for (const v of raw) {
+    const email = String(v || '').trim()
+    if (!EMAIL_RE.test(email)) return null
+    out.push(email)
+  }
+  return Array.from(new Set(out))
 }
 
 const validatePayload = (body) => {
@@ -288,6 +306,329 @@ router.post('/preview-metrics', authenticateToken, (req, res) => {
     targetGroupId,
     EXECUTION_MODE,
     JSON.stringify({ rendered_ruby: rubyContent, metric_ids: metricIds, kind: 'preview_metrics' }),
+    req.user.id,
+  )
+  const executionId = execResult.lastInsertRowid
+
+  runSsmExecution({
+    executionId,
+    targetGroup: {
+      access_key_id: targetGroup.access_key_id,
+      secret_access_key: targetGroup.secret_access_key,
+      region: targetGroup.region || targetGroup.credential_region,
+      aws_tag_key: targetGroup.aws_tag_key,
+      aws_tag_value: targetGroup.aws_tag_value,
+    },
+    rubyContent,
+  })
+
+  return res.status(202).json({
+    success: true,
+    data: { executionId, status: 'pending' },
+  })
+})
+
+// POST /api/business-case-creator/update
+// Atomic update — in a single transaction: removes the selected metric
+// associations (+ their responses), then adds metrics — any mix of brand-new
+// rows and existing ids — to the problem. Destructive: removing associations
+// deletes their evaluation responses.
+//   remove_metric_ids: OPTIONAL array — metrics to remove (empty removes none).
+//   metrics:           OPTIONAL array — brand-new metrics to create.
+//   metric_ids:        OPTIONAL array — existing metric ids to associate.
+// At least one of the three must be non-empty.
+// Async — returns { executionId }; frontend polls GET /executions/:id and reads
+// parsed.removed_associations / parsed.removed_responses / parsed.added_metric_ids.
+router.post('/update', authenticateToken, (req, res) => {
+  const errors = []
+
+  const problemId = Number(req.body?.problem_id)
+  if (!Number.isInteger(problemId) || problemId <= 0) {
+    errors.push('problem_id: must be a positive integer')
+  }
+
+  const targetGroupId = Number(req.body?.target_group_id)
+  if (!Number.isInteger(targetGroupId) || targetGroupId <= 0) {
+    errors.push('target_group_id: required')
+  }
+
+  // remove_metric_ids is optional. If supplied, every value must be a positive
+  // integer. Empty/absent → remove nothing.
+  let removeMetricIds = []
+  const rawRemove = req.body?.remove_metric_ids
+  if (Array.isArray(rawRemove) && rawRemove.length > 0) {
+    const sanitized = sanitizeMetricIds(rawRemove)
+    if (!sanitized) {
+      errors.push('remove_metric_ids: must be positive integers')
+    } else {
+      removeMetricIds = sanitized
+    }
+  }
+
+  // Add step — both are optional and can be combined:
+  //   metrics: brand-new metrics to create.
+  //   metric_ids: existing metric ids to associate (from search).
+  let metrics = []
+  const rawMetrics = req.body?.metrics
+  if (Array.isArray(rawMetrics) && rawMetrics.length > 0) {
+    rawMetrics.forEach((m, i) => errors.push(...validateMetric(m, i)))
+    metrics = rawMetrics
+  }
+
+  let addMetricIds = []
+  const rawAdd = req.body?.metric_ids
+  if (Array.isArray(rawAdd) && rawAdd.length > 0) {
+    const sanitized = sanitizeMetricIds(rawAdd)
+    if (!sanitized) {
+      errors.push('metric_ids: must be positive integers')
+    } else {
+      addMetricIds = sanitized
+    }
+  }
+
+  // An update must do at least one thing.
+  if (removeMetricIds.length === 0 && metrics.length === 0 && addMetricIds.length === 0) {
+    errors.push('Nothing to update: select metrics to remove and/or add')
+  }
+
+  if (errors.length > 0) {
+    return res.status(400).json({ success: false, message: 'Validation failed', errors })
+  }
+
+  const targetGroup = db.prepare(`
+    SELECT tg.*, ic.access_key_id, ic.secret_access_key, ic.region as credential_region
+    FROM target_groups tg
+    JOIN iam_credentials ic ON tg.iam_credential_id = ic.id
+    WHERE tg.id = ?
+  `).get(targetGroupId)
+  if (!targetGroup) {
+    return res.status(404).json({ success: false, message: 'Target group not found' })
+  }
+
+  let rubyContent
+  try {
+    rubyContent = renderUpdateBusinessCaseScript({
+      problemId,
+      removeMetricIds,
+      metrics,
+      addMetricIds,
+    })
+  } catch (e) {
+    return res.status(400).json({ success: false, message: `Failed to render Ruby: ${e.message}` })
+  }
+
+  const sys = getSystemScriptIds() || ensureSystemScripts()
+  if (!sys) {
+    return res.status(500).json({ success: false, message: 'System scripts not seeded yet. Try again.' })
+  }
+
+  const execResult = db.prepare(`
+    INSERT INTO script_executions
+      (script_id, target_group_id, execution_mode, template_variables, status, executed_by)
+    VALUES (?, ?, ?, ?, 'pending', ?)
+  `).run(
+    sys.updateScriptId,
+    targetGroupId,
+    EXECUTION_MODE,
+    JSON.stringify({
+      rendered_ruby: rubyContent,
+      problem_id: problemId,
+      remove_metric_ids: removeMetricIds,
+      add_metric_ids: addMetricIds,
+      new_metric_count: metrics.length,
+      kind: 'update_business_case',
+    }),
+    req.user.id,
+  )
+  const executionId = execResult.lastInsertRowid
+
+  runSsmExecution({
+    executionId,
+    targetGroup: {
+      access_key_id: targetGroup.access_key_id,
+      secret_access_key: targetGroup.secret_access_key,
+      region: targetGroup.region || targetGroup.credential_region,
+      aws_tag_key: targetGroup.aws_tag_key,
+      aws_tag_value: targetGroup.aws_tag_value,
+    },
+    rubyContent,
+  })
+
+  return res.status(202).json({
+    success: true,
+    data: { executionId, status: 'pending' },
+  })
+})
+
+// GET /api/business-case-creator/metabase/health
+// Verifies Metabase connectivity + API key and reports which card ids are set.
+router.get('/metabase/health', authenticateToken, async (req, res) => {
+  try {
+    const ping = await metabaseService.ping()
+    return res.json({
+      success: true,
+      data: {
+        ...ping,
+        candidateEmailsCardId: config.metabase.candidateEmailsCardId,
+        candidateEmailsParam: config.metabase.candidateEmailsParam,
+      },
+    })
+  } catch (e) {
+    return res.status(502).json({ success: false, message: e.message })
+  }
+})
+
+// GET /api/business-case-creator/problems/search?q=...  (Metabase-backed)
+router.get('/problems/search', authenticateToken, async (req, res) => {
+  const q = String(req.query.q || '').trim()
+  if (q.length < 1) {
+    return res.json({ success: true, data: { results: [] } })
+  }
+  if (!metabaseService.isConfigured()) {
+    return res.status(503).json({ success: false, message: 'Metabase is not configured.' })
+  }
+  try {
+    const results = await metabaseService.searchProblems(q)
+    return res.json({ success: true, data: { results } })
+  } catch (e) {
+    console.error('problems/search (metabase) error:', e)
+    return res.status(502).json({ success: false, message: e.message || 'Metabase query failed' })
+  }
+})
+
+// GET /api/business-case-creator/metrics/search?q=...  (Metabase-backed)
+router.get('/metrics/search', authenticateToken, async (req, res) => {
+  const q = String(req.query.q || '').trim()
+  if (q.length < 1) {
+    return res.json({ success: true, data: { results: [] } })
+  }
+  if (!metabaseService.isConfigured()) {
+    return res.status(503).json({ success: false, message: 'Metabase is not configured.' })
+  }
+  try {
+    const results = await metabaseService.searchMetrics(q)
+    return res.json({ success: true, data: { results } })
+  } catch (e) {
+    console.error('metrics/search (metabase) error:', e)
+    return res.status(502).json({ success: false, message: e.message || 'Metabase query failed' })
+  }
+})
+
+// GET /api/business-case-creator/problems/:problemId/metrics  (Metabase-backed)
+// Current evaluation-metric associations for the problem.
+router.get('/problems/:problemId/metrics', authenticateToken, async (req, res) => {
+  const problemId = Number(req.params.problemId)
+  if (!Number.isInteger(problemId) || problemId <= 0) {
+    return res.status(400).json({ success: false, message: 'problemId: must be a positive integer' })
+  }
+  if (!metabaseService.isConfigured()) {
+    return res.status(503).json({ success: false, message: 'Metabase is not configured.' })
+  }
+  try {
+    const metrics = await metabaseService.getProblemMetrics(problemId)
+    return res.json({ success: true, data: { metrics } })
+  } catch (e) {
+    console.error('problems/:id/metrics (metabase) error:', e)
+    return res.status(502).json({ success: false, message: e.message || 'Metabase query failed' })
+  }
+})
+
+// POST /api/business-case-creator/candidate-emails
+// Read-only helper for the Reevaluate tab. Fetches the distinct emails of every
+// user with an evaluation response for the problem — via Metabase (a saved
+// question), NOT the Rails instance. Synchronous: returns { emails, count }.
+router.post('/candidate-emails', authenticateToken, async (req, res) => {
+  const problemId = Number(req.body?.problem_id)
+  if (!Number.isInteger(problemId) || problemId <= 0) {
+    return res.status(400).json({ success: false, message: 'problem_id: must be a positive integer' })
+  }
+
+  if (!metabaseService.isConfigured()) {
+    return res.status(503).json({
+      success: false,
+      message: 'Metabase is not configured. Set METABASE_URL and METABASE_API_KEY.',
+    })
+  }
+
+  try {
+    const emails = await metabaseService.getCandidateEmails(problemId)
+    return res.json({ success: true, data: { emails, count: emails.length } })
+  } catch (e) {
+    console.error('candidate-emails (metabase) error:', e)
+    return res.status(502).json({ success: false, message: e.message || 'Metabase query failed' })
+  }
+})
+
+// POST /api/business-case-creator/reevaluate
+// Re-runs the SmartJudge evaluation for a problem across all provided candidate
+// emails, in one SSM run (chunked internally for logging). Async — returns
+// { executionId }; frontend polls GET /executions/:id and reads
+// parsed.total / parsed.ok_count / parsed.error_count once terminal.
+router.post('/reevaluate', authenticateToken, (req, res) => {
+  const problemId = Number(req.body?.problem_id)
+  if (!Number.isInteger(problemId) || problemId <= 0) {
+    return res.status(400).json({ success: false, message: 'problem_id: must be a positive integer' })
+  }
+  const targetGroupId = Number(req.body?.target_group_id)
+  if (!Number.isInteger(targetGroupId) || targetGroupId <= 0) {
+    return res.status(400).json({ success: false, message: 'target_group_id: required' })
+  }
+
+  const emails = sanitizeEmails(req.body?.emails)
+  if (!emails) {
+    return res.status(400).json({
+      success: false,
+      message: 'emails: must be a non-empty array of valid email addresses',
+    })
+  }
+
+  // chunk_size is optional (default 5) — batches the emails for logging only.
+  let chunkSize = 5
+  if (req.body?.chunk_size != null) {
+    const n = Number(req.body.chunk_size)
+    if (!Number.isInteger(n) || n <= 0) {
+      return res.status(400).json({ success: false, message: 'chunk_size: must be a positive integer' })
+    }
+    chunkSize = n
+  }
+
+  const targetGroup = db.prepare(`
+    SELECT tg.*, ic.access_key_id, ic.secret_access_key, ic.region as credential_region
+    FROM target_groups tg
+    JOIN iam_credentials ic ON tg.iam_credential_id = ic.id
+    WHERE tg.id = ?
+  `).get(targetGroupId)
+  if (!targetGroup) {
+    return res.status(404).json({ success: false, message: 'Target group not found' })
+  }
+
+  let rubyContent
+  try {
+    rubyContent = renderReevaluateResponsesScript({ problemId, emails, chunkSize })
+  } catch (e) {
+    return res.status(400).json({ success: false, message: `Failed to render Ruby: ${e.message}` })
+  }
+
+  const sys = getSystemScriptIds() || ensureSystemScripts()
+  if (!sys) {
+    return res.status(500).json({ success: false, message: 'System scripts not seeded yet. Try again.' })
+  }
+
+  const execResult = db.prepare(`
+    INSERT INTO script_executions
+      (script_id, target_group_id, execution_mode, template_variables, status, executed_by)
+    VALUES (?, ?, ?, ?, 'pending', ?)
+  `).run(
+    sys.reevaluateScriptId,
+    targetGroupId,
+    EXECUTION_MODE,
+    JSON.stringify({
+      rendered_ruby: rubyContent,
+      problem_id: problemId,
+      email_count: emails.length,
+      chunk_size: chunkSize,
+      kind: 'reevaluate_responses',
+    }),
     req.user.id,
   )
   const executionId = execResult.lastInsertRowid

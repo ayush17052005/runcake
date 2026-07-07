@@ -284,6 +284,49 @@ export const businessCaseCreatorAPI = {
     })
   },
 
+  // Atomic update. Removes the selected metric associations (+ responses) then
+  // adds new metrics (create-new or associate-existing). Async: returns
+  // { executionId }; poll getExecution for parsed.removed_associations /
+  // parsed.removed_responses / parsed.added_metric_ids.
+  update: async (payload) => {
+    return apiCall('/business-case-creator/update', {
+      method: 'POST',
+      body: payload,
+    })
+  },
+
+  // Metabase-backed lookups for the Update tab (synchronous).
+  searchProblems: async (q) => {
+    return apiCall(`/business-case-creator/problems/search?q=${encodeURIComponent(q)}`)
+  },
+
+  getProblemMetrics: async (problemId) => {
+    return apiCall(`/business-case-creator/problems/${problemId}/metrics`)
+  },
+
+  searchMetrics: async (q) => {
+    return apiCall(`/business-case-creator/metrics/search?q=${encodeURIComponent(q)}`)
+  },
+
+  // Read-only: fetch the emails of users with evaluation responses for a
+  // problem. Async: returns { executionId }; poll getExecution for parsed.emails.
+  fetchCandidateEmails: async (payload) => {
+    return apiCall('/business-case-creator/candidate-emails', {
+      method: 'POST',
+      body: payload,
+    })
+  },
+
+  // Re-runs SmartJudge evaluation for a problem across candidate emails. Async:
+  // returns { executionId }; poll getExecution for parsed.total / ok_count /
+  // error_count and the full per-email table in `output`.
+  reevaluate: async (payload) => {
+    return apiCall('/business-case-creator/reevaluate', {
+      method: 'POST',
+      body: payload,
+    })
+  },
+
   getExecution: async (executionId) => {
     return apiCall(`/business-case-creator/executions/${executionId}`)
   },

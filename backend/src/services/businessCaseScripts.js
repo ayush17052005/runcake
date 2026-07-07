@@ -294,6 +294,298 @@ const parsePreviewResult = (output) => {
   }
 }
 
+// --- Update: remove selected metrics, then add new ones (atomic) ------------
+//
+// A single ActiveRecord transaction that:
+//   1. Removes the selected metric associations (scoped by remove_metric_ids;
+//      empty removes none) and their EvaluationResponse rows.
+//   2. Adds new metrics — either creating new EvaluationMetric rows from the
+//      `metrics` heredoc (add_mode='create') or reusing existing metric ids
+//      (add_mode='existing') — and associates them to the problem.
+// All-or-nothing: if the add step fails, the removals roll back too. Emits
+// BCC_RESULT_JSON so the existing /executions endpoint + parseCombinedResult
+// handle it unchanged.
+const UPDATE_BUSINESS_CASE_SCRIPT_RUBY = `require 'json'
+
+problem_id = {{problem_id}}
+remove_metric_ids = {{remove_metric_ids_json}}
+add_metric_ids = {{add_metric_ids_json}}
+
+metrics_input = <<~METRICS
+{{metrics}}
+METRICS
+
+result_summary = {
+  problem_id: problem_id,
+  status: 'failed',
+  removed_associations: 0,
+  removed_responses: 0,
+  added_metric_ids: [],
+  message: nil
+}
+
+begin
+  problem = Problem.find(problem_id)
+  puts "Found problem #{problem.id}: #{problem.problem_statement}"
+
+  ActiveRecord::Base.transaction do
+    # ----- 1. Remove the selected metric associations + their responses -----
+    scope = EvaluationMetricAssociation.where(owner: problem)
+    scope = scope.where(evaluation_metric_id: remove_metric_ids) if remove_metric_ids.present?
+    assoc_ids = scope.pluck(:id)
+    if assoc_ids.any?
+      removed_responses = EvaluationResponse.where(evaluation_metric_association_id: assoc_ids).count
+      EvaluationResponse.where(evaluation_metric_association_id: assoc_ids).delete_all
+      EvaluationMetricAssociation.where(id: assoc_ids).destroy_all
+      result_summary[:removed_associations] = assoc_ids.length
+      result_summary[:removed_responses] = removed_responses
+    end
+    puts "Removed #{result_summary[:removed_associations]} association(s) and #{result_summary[:removed_responses]} response(s)"
+
+    # ----- 2. Create any brand-new metrics from the metrics heredoc -----
+    created_ids = []
+    new_metrics = []
+    metrics_input.split("\\n").each do |metric|
+      next if metric.strip.empty?
+      key, value = metric.split(":", 2)
+      new_metrics << EvaluationMetric.new(
+        name: key.to_s.strip,
+        description: value.to_s.strip,
+        min_score: 0,
+        max_score: 10,
+        status: :active
+      )
+    end
+
+    if new_metrics.any?
+      last_id_before = EvaluationMetric.maximum(:id) || 0
+      import_result = EvaluationMetric.import(
+        new_metrics,
+        on_duplicate_key_ignore: true,
+        validate: true
+      )
+      puts "Import num_inserts: #{import_result.num_inserts}"
+      submitted_names = new_metrics.map(&:name)
+      created_ids = EvaluationMetric.where('id > ?', last_id_before)
+                                    .where(name: submitted_names)
+                                    .order(:id)
+                                    .pluck(:id)
+      raise "No new metric rows created (expected #{submitted_names.length})" if created_ids.empty?
+    end
+
+    # ----- 3. Validate the existing metric ids to (re)associate -----
+    if add_metric_ids.present?
+      found = EvaluationMetric.where(id: add_metric_ids).pluck(:id)
+      missing = add_metric_ids - found
+      raise "Metric ids not found: #{missing.inspect}" unless missing.empty?
+    end
+
+    # ----- 4. Associate created + existing metrics with the problem -----
+    # Dedupe defensively: never re-add a metric we just removed (avoid
+    # remove+add churn) and never duplicate a metric still associated.
+    remaining_ids = EvaluationMetricAssociation.where(owner: problem).pluck(:evaluation_metric_id)
+    all_ids = (created_ids + add_metric_ids).uniq - remove_metric_ids - remaining_ids
+    all_ids.each do |metric_id|
+      EvaluationMetricAssociation.create_evaluation_metric_association(
+        "Problem",
+        problem.id,
+        metric_id
+      )
+    end
+    puts "Associated #{all_ids.length} metric(s): #{all_ids.inspect}"
+
+    result_summary[:added_metric_ids] = all_ids
+    result_summary[:status] = 'success'
+  end
+
+  puts "============== Done =============="
+  puts "Update complete for problem #{problem_id}"
+  puts "============== Done =============="
+rescue => e
+  result_summary[:status] = 'failed'
+  result_summary[:message] = e.message
+  puts "============== Error =============="
+  puts "Error: #{e.message}"
+  puts e.backtrace.take(10).join("\\n") if e.backtrace
+  puts "============== Error =============="
+end
+
+puts "BCC_RESULT_JSON=#{result_summary.to_json}"
+`
+
+// removeMetricIds: metrics the user selected to remove (empty removes none).
+// metrics: brand-new metrics to create (may be empty). addMetricIds: existing
+// metric ids to associate (may be empty). Created + existing are unioned and
+// associated. All three can be combined in one update.
+const renderUpdateBusinessCaseScript = ({ problemId, removeMetricIds, metrics, addMetricIds }) =>
+  renderTemplate(UPDATE_BUSINESS_CASE_SCRIPT_RUBY, {
+    problem_id: String(problemId),
+    remove_metric_ids_json: JSON.stringify(Array.isArray(removeMetricIds) ? removeMetricIds : []),
+    add_metric_ids_json: JSON.stringify(Array.isArray(addMetricIds) ? addMetricIds : []),
+    metrics: formatMetricsString(metrics || []),
+  })
+
+// --- Reevaluate responses ---------------------------------------------------
+//
+// Re-runs the SmartJudge business-case evaluation for every candidate response
+// of a problem. Emails are sliced into chunks (chunk_size, default 5) purely
+// for batched logging; unlike the reference one-shot, this loops over ALL
+// chunks so every email is processed in a single SSM run. The per-email body
+// is the exact reference logic (find IBTSP, keep one AI evaluator association,
+// archive the rest, run EvaluateService, recompute scores). Per-email failures
+// are captured and do not abort the run. Emits BCC_RESULT_JSON (compact — the
+// full per-email table is in stdout) so the existing poller handles it.
+const REEVALUATE_RESPONSES_SCRIPT_RUBY = `require 'json'
+
+problem_id = {{problem_id}}
+chunk_size = {{chunk_size}}
+
+emails = %w[
+{{emails}}
+]
+
+result_summary = {
+  problem_id: problem_id,
+  status: 'failed',
+  total: emails.size,
+  ok_count: 0,
+  error_count: 0,
+  message: nil
+}
+
+begin
+  problem = Problem.find(problem_id)
+
+  ai_ids = EvaluationEvaluatorAssociation.ai_evaluator_ids
+  assistant_user_id = ai_ids.first
+  raise "No AI evaluator user found" unless assistant_user_id.present?
+
+  results = []
+  total_chunks = (emails.size.to_f / chunk_size).ceil
+
+  emails.each_slice(chunk_size).with_index do |batch_emails, chunk_index|
+    puts "Running batch #{chunk_index + 1}/#{total_chunks}: #{batch_emails.inspect}"
+
+    batch_emails.each do |email|
+      begin
+        user = User.find_by(email: email)
+
+        ibtsp = InterviewbitTestSessionProblem
+          .joins(:interviewbit_test_session)
+          .where(problem_id: problem.id)
+          .where(
+            "interviewbit_test_sessions.user_id = ? OR interviewbit_test_sessions.candidate_email = ?",
+            user&.id,
+            email
+          )
+          .order(created_at: :desc)
+          .first
+
+        raise "No matching IBTSP" unless ibtsp.present?
+
+        mode = EvaluationEntity.configured_evaluation_mode(ibtsp)
+        raise "Wrong mode=#{mode}; expected business_case_study_judge" unless mode == :business_case_study_judge
+
+        ee = ibtsp.evaluation_entity || EvaluationEntity.create_evaluation_entity(ibtsp.class.name, ibtsp.id)
+        old_score = ibtsp.score
+
+        keep = ee.evaluation_evaluator_associations.non_peer
+          .where(evaluator_id: ai_ids)
+          .order(created_at: :desc)
+          .first
+
+        keep ||= EvaluationEvaluatorAssociation.create_association(ee.id, assistant_user_id, :non_peer)
+        keep ||= ee.evaluation_evaluator_associations.non_peer.where(evaluator_id: assistant_user_id).order(created_at: :desc).first
+
+        raise "Could not create/find AI EEA" unless keep.present?
+
+        ee.evaluation_evaluator_associations.non_peer.where.not(id: keep.id).update_all(
+          evaluation_status: EvaluationEvaluatorAssociation.evaluation_statuses[:archived],
+          updated_at: Time.current
+        )
+
+        ee.update_columns(
+          completed_non_peer_count: keep.completed? ? 1 : 0,
+          updated_at: Time.current
+        )
+
+        keep.update!(evaluation_status: :started) if keep.completed? || keep.archived?
+
+        eval_result = EvaluationEntities::SmartJudge::EvaluateService.execute(
+          evaluation_entity_id: ee.id,
+          evaluation_id: keep.id,
+          retry_count: 0
+        )
+
+        raise "Evaluation failed: #{eval_result.inspect}" unless eval_result["success"] || eval_result[:success]
+
+        ibtsp.reload
+        new_score = ibtsp.cumulative_crowd_evaluation_score(options: { created_at: ee.created_at }, with_decay: true)
+        ibtsp.update_columns(score: new_score, updated_at: Time.current) if new_score.present?
+
+        session = ibtsp.interviewbit_test_session
+        session.update_score
+        session.update_session_rating_in_cache_store
+
+        results << {
+          email: email,
+          ibtsp_id: ibtsp.id,
+          ee_id: ee.id,
+          eea_id: keep.reload.id,
+          old_score: old_score,
+          new_score: ibtsp.reload.score,
+          session_id: session.id,
+          session_score: session.reload.score,
+          status: "ok"
+        }
+
+        puts "OK #{email}: #{old_score} -> #{ibtsp.score}"
+      rescue => e
+        results << { email: email, status: "error", error: "#{e.class}: #{e.message}" }
+        puts "ERROR #{email}: #{e.class}: #{e.message}"
+      end
+    end
+  end
+
+  puts "\\nEMAIL\\tOLD_SCORE\\tNEW_SCORE\\tIBTSP\\tEE\\tEEA\\tSESSION_SCORE\\tSTATUS"
+  results.each do |r|
+    puts [
+      r[:email],
+      r[:old_score],
+      r[:new_score],
+      r[:ibtsp_id],
+      r[:ee_id],
+      r[:eea_id],
+      r[:session_score],
+      r[:status],
+      r[:error]
+    ].join("\\t")
+  end
+
+  result_summary[:ok_count] = results.count { |r| r[:status] == "ok" }
+  result_summary[:error_count] = results.count { |r| r[:status] == "error" }
+  result_summary[:status] = 'success'
+rescue => e
+  result_summary[:status] = 'failed'
+  result_summary[:message] = "#{e.class}: #{e.message}"
+  puts "============== Error =============="
+  puts "Error: #{e.message}"
+  puts e.backtrace.take(10).join("\\n") if e.backtrace
+  puts "============== Error =============="
+end
+
+puts "BCC_RESULT_JSON=#{result_summary.to_json}"
+`
+
+// emails: array of validated email strings (no whitespace — they render inside
+// a Ruby %w[] literal). chunkSize defaults to 5.
+const renderReevaluateResponsesScript = ({ problemId, emails, chunkSize }) =>
+  renderTemplate(REEVALUATE_RESPONSES_SCRIPT_RUBY, {
+    problem_id: String(problemId),
+    chunk_size: String(Number.isInteger(chunkSize) && chunkSize > 0 ? chunkSize : 5),
+    emails: (Array.isArray(emails) ? emails : []).join('\n  '),
+  })
+
 // Reject metric fields that would break the Ruby's `metric.split(":", 2)` or
 // the <<~METRICS heredoc. Called from the route handler.
 const validateMetric = (metric, index) => {
@@ -340,6 +632,10 @@ module.exports = {
   renderCombinedScript,
   renderAssociateExistingScript,
   renderPreviewMetricsScript,
+  renderUpdateBusinessCaseScript,
+  UPDATE_BUSINESS_CASE_SCRIPT_RUBY,
+  renderReevaluateResponsesScript,
+  REEVALUATE_RESPONSES_SCRIPT_RUBY,
   parseCombinedResult,
   parsePreviewResult,
   validateMetric,

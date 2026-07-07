@@ -11,6 +11,8 @@ const { db } = require('../database/db')
 const SYSTEM_SCRIPT_NAMES = {
   METRICS: '__system__create_evaluation_metrics',
   BUSINESS_CASE: '__system__business_case_creation',
+  UPDATE: '__system__business_case_update',
+  REEVALUATE: '__system__business_case_reevaluate',
 }
 
 const SYSTEM_PREFIX = '__system__'
@@ -67,6 +69,8 @@ const ensureSystemScripts = () => {
   cached = {
     metricsScriptId: ensureScript(SYSTEM_SCRIPT_NAMES.METRICS, creatorId, runnerId),
     caseScriptId: ensureScript(SYSTEM_SCRIPT_NAMES.BUSINESS_CASE, creatorId, runnerId),
+    updateScriptId: ensureScript(SYSTEM_SCRIPT_NAMES.UPDATE, creatorId, runnerId),
+    reevaluateScriptId: ensureScript(SYSTEM_SCRIPT_NAMES.REEVALUATE, creatorId, runnerId),
   }
   return cached
 }
@@ -80,6 +84,8 @@ const isSystemName = (name) =>
 const SYSTEM_DISPLAY_NAMES = {
   [SYSTEM_SCRIPT_NAMES.METRICS]: 'Business case metrics creation',
   [SYSTEM_SCRIPT_NAMES.BUSINESS_CASE]: 'Business case creation',
+  [SYSTEM_SCRIPT_NAMES.UPDATE]: 'Business case update (remove metrics)',
+  [SYSTEM_SCRIPT_NAMES.REEVALUATE]: 'Business case reevaluation',
 }
 
 const toDisplayName = (name) => {
